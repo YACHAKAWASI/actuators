@@ -1,7 +1,7 @@
 #ifndef _MOTOR_DRIVER_H_
 #define _MOTOR_DRIVER_H_
 
-#include "device_pack/DEV_Config.h"
+#include "actuator_motor/DEV_Config.h"
 #include <stdint.h>
 
 #ifdef __cplusplus

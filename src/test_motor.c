@@ -1,6 +1,6 @@
-#include "device_pack/DEV_Config.h"
-#include "device_pack/motor_driver.h"
-#include "device_pack/pins.h"
+#include "actuator_motor/DEV_Config.h"
+#include "actuator_motor/motor_driver.h"
+#include "actuator_motor/pins.h"
 
 int main() {
   if (DEV_ModuleInit() != 0) {

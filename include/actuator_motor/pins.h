@@ -1,5 +1,5 @@
-#ifndef _DEVICE_PACK_PINS_H_
-#define _DEVICE_PACK_PINS_H_
+#ifndef _ACTUATOR_MOTOR_PINS_H_
+#define _ACTUATOR_MOTOR_PINS_H_
 
 /* Numeración BCM (wiringPiSetupGpio) */
 
@@ -13,6 +13,6 @@
 #define MOTOR_B_IN2 24
 #define MOTOR_B_EN  25*/
 
-#endif /* _DEVICE_PACK_PINS_H_ */
+#endif /* _ACTUATOR_MOTOR_PINS_H_ */
 
 

@@ -1,113 +1,204 @@
-#include "device_pack/motor_driver.h" // interfaz pública del driver L298N (tipos y prototipos)
+#include "actuator_motor/motor_driver.h"  // interfaz pública del driver L298N
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
 
-#ifdef USE_WIRINGPI_LIB // si se compila con backend WiringPi
-#include <softPwm.h> // funciones de PWM por software de WiringPi
-#endif // USE_WIRINGPI_LIB
+// ================================================================
+//  Opcional: PWM por software con hilos (desactivado por defecto)
+//  Pon USE_SW_PWM 1 si quieres PWM por software sencillo.
+// ================================================================
+#ifndef USE_SW_PWM
+#  define USE_SW_PWM 0
+#endif
 
-static UBYTE pwm_enabled_pins[64] = {0}; // mapa para saber si un pin usa PWM por software
+#if USE_SW_PWM
+  #include <pthread.h>
+  #include <stdatomic.h>
 
-void L298N_MotorInit(const L298NMotorPins *motor, UBYTE use_pwm) // inicializa GPIOs y PWM del motor
+  typedef struct {
+      UWORD pin;
+      atomic_int duty;      // 0..100
+      atomic_int running;   // 0/1
+      pthread_t thread;
+      unsigned pwm_hz;      // frecuencia (p.ej. 200 Hz)
+  } sw_pwm_t;
+
+  // Mapa simple: un PWM por pin BCM (hasta 128 por si acaso)
+  static sw_pwm_t* sw_pwm_map[128] = {0};
+
+  static void* sw_pwm_loop(void* arg) {
+      sw_pwm_t* ctx = (sw_pwm_t*)arg;
+      if (!ctx) return NULL;
+
+      // Periodo en microsegundos
+      unsigned period_us = (ctx->pwm_hz > 0) ? (1000000u / ctx->pwm_hz) : 5000u; // 200 Hz por defecto
+
+      while (atomic_load(&ctx->running)) {
+          int duty = atomic_load(&ctx->duty);    // 0..100
+          if (duty <= 0) {
+              DEV_Digital_Write(ctx->pin, 0);
+              usleep(period_us);
+              continue;
+          }
+          if (duty >= 100) {
+              DEV_Digital_Write(ctx->pin, 1);
+              usleep(period_us);
+              continue;
+          }
+          // Tiempo ON/OFF según duty
+          unsigned on_us  = (period_us * (unsigned)duty) / 100u;
+          unsigned off_us = period_us - on_us;
+          DEV_Digital_Write(ctx->pin, 1);
+          if (on_us)  usleep(on_us);
+          DEV_Digital_Write(ctx->pin, 0);
+          if (off_us) usleep(off_us);
+      }
+
+      // Asegura el pin en bajo al salir
+      DEV_Digital_Write(ctx->pin, 0);
+      return NULL;
+  }
+
+  static void sw_pwm_start(UWORD pin, unsigned hz, int initial_duty) {
+      if (pin >= (UWORD)(sizeof(sw_pwm_map)/sizeof(sw_pwm_map[0]))) return;
+      if (sw_pwm_map[pin]) return; // ya iniciado
+
+      sw_pwm_t* ctx = (sw_pwm_t*)calloc(1, sizeof(sw_pwm_t));
+      if (!ctx) return;
+      ctx->pin = pin;
+      ctx->pwm_hz = (hz > 0) ? hz : 200; // 200 Hz por defecto
+      atomic_store(&ctx->duty, initial_duty);
+      atomic_store(&ctx->running, 1);
+
+      // Asegura que el pin está como salida
+      DEV_GPIO_Mode(pin, 1);
+      // Lanza hilo
+      if (pthread_create(&ctx->thread, NULL, sw_pwm_loop, ctx) != 0) {
+          free(ctx);
+          return;
+      }
+      sw_pwm_map[pin] = ctx;
+  }
+
+  static void sw_pwm_set_duty(UWORD pin, int duty) {
+      if (pin >= (UWORD)(sizeof(sw_pwm_map)/sizeof(sw_pwm_map[0]))) return;
+      sw_pwm_t* ctx = sw_pwm_map[pin];
+      if (!ctx) return;
+      if (duty < 0) duty = 0;
+      if (duty > 100) duty = 100;
+      atomic_store(&ctx->duty, duty);
+  }
+
+  static void sw_pwm_stop(UWORD pin) {
+      if (pin >= (UWORD)(sizeof(sw_pwm_map)/sizeof(sw_pwm_map[0]))) return;
+      sw_pwm_t* ctx = sw_pwm_map[pin];
+      if (!ctx) return;
+      atomic_store(&ctx->running, 0);
+      pthread_join(ctx->thread, NULL);
+      DEV_Digital_Write(pin, 0);
+      free(ctx);
+      sw_pwm_map[pin] = NULL;
+  }
+#endif // USE_SW_PWM
+
+// Mantener el mismo mapa que ya tenías (pero ahora lo usamos para PWM opcional)
+static UBYTE pwm_enabled_pins[128] = {0}; // aumentado a 128 por seguridad
+
+void L298N_MotorInit(const L298NMotorPins *motor, UBYTE use_pwm)
 {
-    if (motor == NULL) { // validar puntero
-        return; // nada que hacer si motor es nulo
+    if (motor == NULL) return;
+
+    // Configura pines como salida
+    DEV_GPIO_Mode(motor->input_pin_1, 1);
+    DEV_GPIO_Mode(motor->input_pin_2, 1);
+    DEV_GPIO_Mode(motor->enable_pin, 1);
+
+    // Estado inicial
+    DEV_Digital_Write(motor->input_pin_1, 0);
+    DEV_Digital_Write(motor->input_pin_2, 0);
+    DEV_Digital_Write(motor->enable_pin, 0);
+
+#if USE_SW_PWM
+    if (use_pwm) {
+        // Inicia PWM software en enable_pin a 200 Hz, duty 0%
+        sw_pwm_start(motor->enable_pin, 200, 0);
+        pwm_enabled_pins[motor->enable_pin] = 1;
+    } else {
+        pwm_enabled_pins[motor->enable_pin] = 0;
     }
-
-    DEV_GPIO_Mode(motor->input_pin_1, 1); // configurar IN1 como salida
-    DEV_GPIO_Mode(motor->input_pin_2, 1); // configurar IN2 como salida
-    DEV_GPIO_Mode(motor->enable_pin, 1); // configurar ENA/ENB como salida
-
-    DEV_Digital_Write(motor->input_pin_1, 0); // estado inicial bajo
-    DEV_Digital_Write(motor->input_pin_2, 0); // estado inicial bajo
-
-#ifdef USE_WIRINGPI_LIB // rama con PWM por software disponible
-    if (use_pwm) { // si se solicita PWM
-        if (softPwmCreate((int)motor->enable_pin, 0, 100) == 0) { // crear PWM [0..100]
-            pwm_enabled_pins[motor->enable_pin] = 1; // marcar pin con PWM activo
-        } else { // fallo al crear PWM
-            pwm_enabled_pins[motor->enable_pin] = 0; // sin PWM
-            DEV_Digital_Write(motor->enable_pin, 0); // asegurar salida en bajo
-        }
-    } else { // no se usará PWM
-        pwm_enabled_pins[motor->enable_pin] = 0; // sin PWM
-        DEV_Digital_Write(motor->enable_pin, 0); // salida inicial en bajo
-    }
-#else // sin WiringPi: no hay PWM por software
-    (void)use_pwm; // suprimir warning de parámetro no usado
-    pwm_enabled_pins[motor->enable_pin] = 0; // marcar sin PWM
-    DEV_Digital_Write(motor->enable_pin, 0); // salida inicial en bajo
-#endif // USE_WIRINGPI_LIB
+#else
+    (void)use_pwm; // sin PWM por defecto
+    pwm_enabled_pins[motor->enable_pin] = 0;
+#endif
 }
 
-void L298N_MotorSetDirection(const L298NMotorPins *motor, UBYTE forward) // fija sentido: 1 adelante, 0 atrás
+void L298N_MotorSetDirection(const L298NMotorPins *motor, UBYTE forward)
 {
-    if (motor == NULL) { // validar puntero
-        return; // sin acción
-    }
-    if (forward) { // sentido adelante
-        DEV_Digital_Write(motor->input_pin_1, 1); // IN1 alto
-        DEV_Digital_Write(motor->input_pin_2, 0); // IN2 bajo
-    } else { // sentido atrás
-        DEV_Digital_Write(motor->input_pin_1, 0); // IN1 bajo
-        DEV_Digital_Write(motor->input_pin_2, 1); // IN2 alto
+    if (motor == NULL) return;
+
+    if (forward) {
+        DEV_Digital_Write(motor->input_pin_1, 1);
+        DEV_Digital_Write(motor->input_pin_2, 0);
+    } else {
+        DEV_Digital_Write(motor->input_pin_1, 0);
+        DEV_Digital_Write(motor->input_pin_2, 1);
     }
 }
 
-void L298N_MotorBrake(const L298NMotorPins *motor) // frena cortocircuitando bobinas (IN1=IN2=1)
+void L298N_MotorBrake(const L298NMotorPins *motor)
 {
-    if (motor == NULL) { // validar puntero
-        return; // sin acción
-    }
-    DEV_Digital_Write(motor->input_pin_1, 1); // IN1 alto
-    DEV_Digital_Write(motor->input_pin_2, 1); // IN2 alto
+    if (motor == NULL) return;
 
-#ifdef USE_WIRINGPI_LIB // si PWM por software está activo para ENA/ENB
-    if (motor->enable_pin < 64 && pwm_enabled_pins[motor->enable_pin]) { // rango válido y PWM activo
-        softPwmWrite((int)motor->enable_pin, 100); // duty 100% para freno máximo
-    } else { // sin PWM en ese pin
-        DEV_Digital_Write(motor->enable_pin, 1); // habilitar salida alta
+    // Freno activo: IN1=IN2=1
+    DEV_Digital_Write(motor->input_pin_1, 1);
+    DEV_Digital_Write(motor->input_pin_2, 1);
+
+#if USE_SW_PWM
+    if (motor->enable_pin < 128 && pwm_enabled_pins[motor->enable_pin]) {
+        sw_pwm_set_duty(motor->enable_pin, 100); // duty 100%
+    } else {
+        DEV_Digital_Write(motor->enable_pin, 1);
     }
-#else // sin WiringPi
-    DEV_Digital_Write(motor->enable_pin, 1); // habilitar salida alta
-#endif // USE_WIRINGPI_LIB
+#else
+    DEV_Digital_Write(motor->enable_pin, 1);
+#endif
 }
 
-void L298N_MotorStop(const L298NMotorPins *motor) // libera el motor (ambos IN en bajo, EN en 0/0%)
+void L298N_MotorStop(const L298NMotorPins *motor)
 {
-    if (motor == NULL) { // validar puntero
-        return; // sin acción
+    if (motor == NULL) return;
+
+#if USE_SW_PWM
+    if (motor->enable_pin < 128 && pwm_enabled_pins[motor->enable_pin]) {
+        sw_pwm_set_duty(motor->enable_pin, 0); // duty 0%
+    } else {
+        DEV_Digital_Write(motor->enable_pin, 0);
     }
-#ifdef USE_WIRINGPI_LIB // si PWM por software está activo
-    if (motor->enable_pin < 64 && pwm_enabled_pins[motor->enable_pin]) { // válido y con PWM
-        softPwmWrite((int)motor->enable_pin, 0); // duty 0%
-    } else { // sin PWM
-        DEV_Digital_Write(motor->enable_pin, 0); // salida baja
-    }
-#else // sin WiringPi
-    DEV_Digital_Write(motor->enable_pin, 0); // salida baja
-#endif // USE_WIRINGPI_LIB
-    DEV_Digital_Write(motor->input_pin_1, 0); // IN1 bajo
-    DEV_Digital_Write(motor->input_pin_2, 0); // IN2 bajo
+#else
+    DEV_Digital_Write(motor->enable_pin, 0);
+#endif
+
+    // Entradas en bajo
+    DEV_Digital_Write(motor->input_pin_1, 0);
+    DEV_Digital_Write(motor->input_pin_2, 0);
 }
 
-void L298N_MotorSetSpeed(const L298NMotorPins *motor, UBYTE duty_cycle) // ajusta velocidad vía EN (0..100)
+void L298N_MotorSetSpeed(const L298NMotorPins *motor, UBYTE duty_cycle)
 {
-    if (motor == NULL) { // validar puntero
-        return; // sin acción
+    if (motor == NULL) return;
+    if (duty_cycle > 100) duty_cycle = 100;
+
+#if USE_SW_PWM
+    if (motor->enable_pin < 128 && pwm_enabled_pins[motor->enable_pin]) {
+        sw_pwm_set_duty(motor->enable_pin, (int)duty_cycle);
+        return;
     }
-    if (duty_cycle >= 100) { // saturar al máximo permitido
-        duty_cycle = 100; // limitar a 100
-    }
-#ifdef USE_WIRINGPI_LIB // si hay PWM por software disponible y activo
-    if (motor->enable_pin < 64 && pwm_enabled_pins[motor->enable_pin]) { // válido y con PWM
-        softPwmWrite((int)motor->enable_pin, (int)duty_cycle); // aplicar duty
-        return; // no continuar con salida digital
-    }
-#endif // USE_WIRINGPI_LIB
-    if (duty_cycle == 0) { // sin PWM: aproximación ON/OFF
-        DEV_Digital_Write(motor->enable_pin, 0); // apagado
-    } else { // cualquier valor > 0 se considera encendido
-        DEV_Digital_Write(motor->enable_pin, 1); // encendido
+#endif
+    // Sin PWM: aproximación ON/OFF
+    if (duty_cycle == 0) {
+        DEV_Digital_Write(motor->enable_pin, 0);
+    } else {
+        DEV_Digital_Write(motor->enable_pin, 1);
     }
 }
-
-
