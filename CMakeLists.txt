@@ -44,8 +44,8 @@ target_include_directories(motor_hardware
 target_link_libraries(motor_hardware gpiod pthread)
 
 # ==== Ejecutable de prueba ====
-add_executable(test_motor src/test_motor.c)
-target_link_libraries(test_motor motor_hardware)  # firma plain
+#add_executable(test_motor src/test_motor.c)
+#target_link_libraries(test_motor motor_hardware)  # firma plain
 
 # ==== Nodo ROS 2 ====
 add_executable(motor_node src/motor_node.cpp)
@@ -53,11 +53,11 @@ target_link_libraries(motor_node motor_hardware)  # firma plain
 ament_target_dependencies(motor_node rclcpp geometry_msgs std_msgs)
 
 # ==== Instalación ====
-install(TARGETS motor_hardware test_motor motor_node
-  ARCHIVE DESTINATION lib
-  LIBRARY DESTINATION lib
-  RUNTIME DESTINATION lib/${PROJECT_NAME}
-)
+#install(TARGETS motor_hardware test_motor motor_node
+#  ARCHIVE DESTINATION lib
+  #LIBRARY DESTINATION lib
+ # RUNTIME DESTINATION lib/${PROJECT_NAME}
+#)
 install(DIRECTORY include/ DESTINATION include)
 
 ament_export_include_directories(include)
